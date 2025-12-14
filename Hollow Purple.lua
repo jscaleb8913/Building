@@ -1,294 +1,208 @@
--- Local Script
-local player = game.Players.LocalPlayer
-local char = player.Character
-local UIS = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
 
-local remote = script.RemoteEvent
+local COOLDOWN_TIME = 5
+local DAMAGE_AMOUNT = 100
+local PROJECTILE_DISTANCE = 250
 
-local debounce = false 
-local CD = 5 -- cooldown
+local AbilityState = {
+	Idle = "Idle",
+	Casting = "Casting",
+	Charging = "Charging",
+	Releasing = "Releasing",
+	Cooldown = "Cooldown"
+}
 
-UIS.InputBegan:Connect(function(play,chat)
-	if chat then return end --checks if player is using chat, if yes, then nothing happens
-		if play.KeyCode == Enum.KeyCode.Z then --otherwise the following happens (do i rlly have to explain all this T-T)
-		if debounce == false then
-		debounce = true 
-		remote:FireServer() 
-		wait(CD) 
-		debounce = false 
+local cooldowns = {}
+
+-- Returns character, humanoid, and root if the character is valid
+local function getCharacterData(player)
+	if not player then return nil end
+
+	local character = player.Character
+	if not character then return nil end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid or not root then
+		return nil
+	end
+
+	return {
+		Character = character,
+		Humanoid = humanoid,
+		Root = root
+	}
+end
+
+-- Checks and updates the server-side cooldown
+local function canActivate(player)
+	local lastUse = cooldowns[player]
+	if lastUse and os.clock() - lastUse < COOLDOWN_TIME then
+		return false
+	end
+
+	cooldowns[player] = os.clock()
+	return true
+end
+
+-- Tracks temporary instances so they can be destroyed safely
+local function createCleanupTracker()
+	local tracker = {}
+
+	function tracker:Add(instance)
+		table.insert(self, instance)
+	end
+
+	function tracker:Cleanup()
+		for _, obj in ipairs(self) do
+			if obj and obj.Parent then
+				obj:Destroy()
+			end
+		end
+		table.clear(self)
+	end
+
+	return tracker
+end
+
+-- Collects all particle emitters under a model
+local function collectEmitters(container)
+	local emitters = {}
+	for _, d in ipairs(container:GetDescendants()) do
+		if d:IsA("ParticleEmitter") then
+			table.insert(emitters, d)
 		end
 	end
-end)
+	return emitters
+end
 
---Server Script
-script.Parent.OnServerEvent:Connect(function(Player)
-	local ts = game:GetService("TweenService")
-	local RunService = game:GetService("RunService")
-	local char = Player.Character
-	local hum = char:WaitForChild("Humanoid")	
-	local root = char:WaitForChild("HumanoidRootPart")
+-- Gradually tweens particle colors over time using Heartbeat
+local function tweenEmitterColor(emitters, targetColor, duration)
+	local elapsed = 0
+	local connection
 
-    -- freeze player
-	hum.WalkSpeed = 0
-	hum.JumpPower = 0
-	hum.AutoRotate = false
+	connection = RunService.Heartbeat:Connect(function(dt)
+		elapsed += dt
+		local alpha = math.clamp(elapsed / duration, 0, 1)
+		local eased = alpha * alpha
+
+		for _, emitter in ipairs(emitters) do
+			local start = emitter.Color.Keypoints[1].Value
+			local newColor = Color3.new(
+				start.R + (targetColor.R - start.R) * eased,
+				start.G + (targetColor.G - start.G) * eased,
+				start.B + (targetColor.B - start.B) * eased
+			)
+			emitter.Color = ColorSequence.new(newColor)
+		end
+
+		if alpha >= 1 then
+			connection:Disconnect()
+		end
+	end)
+end
+
+-- Applies damage once per character inside the hitbox
+local function applyDamage(hitbox, sourceCharacter)
+	local hitRegistry = {}
+
+	for _, part in ipairs(workspace:GetPartsInPart(hitbox)) do
+		local targetChar = part:FindFirstAncestorOfClass("Model")
+		if targetChar and targetChar ~= sourceCharacter and not hitRegistry[targetChar] then
+			local humanoid = targetChar:FindFirstChildOfClass("Humanoid")
+			if humanoid then
+				hitRegistry[targetChar] = true
+				humanoid:TakeDamage(DAMAGE_AMOUNT)
+			end
+		end
+	end
+end
+
+local Remote = script:WaitForChild("ActivateAbility")
+
+Remote.OnServerEvent:Connect(function(player)
+	if not canActivate(player) then
+		return
+	end
+
+	local data = getCharacterData(player)
+	if not data then
+		return
+	end
+
+	local character = data.Character
+	local humanoid = data.Humanoid
+	local root = data.Root
+
+	local cleanup = createCleanupTracker()
+	local currentState = AbilityState.Casting
+
+	-- Prevents player movement during the ability
+	humanoid.WalkSpeed = 0
+	humanoid.JumpPower = 0
+	humanoid.AutoRotate = false
 	root.Anchored = true
 
-    -- idk i aint explaining the functions (pls js approve :(  )
-	local function emitOnce(particleParent)
-		for _, descendant in ipairs(particleParent:GetDescendants()) do
-			if descendant:IsA("ParticleEmitter") then
-				descendant.Rate = 0
-				descendant.Enabled = true
-				descendant:Emit(1)
-				task.wait(0.1)
-				descendant.Enabled = false
-			end
-		end
-	end
+	-- Ensures cleanup if the player dies mid-cast
+	humanoid.Died:Connect(function()
+		cleanup:Cleanup()
+	end)
 
-	local function tweenParticlesToMagenta(model, duration)
-		local emitters = {}
-		for _, descendant in ipairs(model:GetDescendants()) do
-			if descendant:IsA("ParticleEmitter") then
-				table.insert(emitters, descendant)
-			end
-		end
+	local projectile = Instance.new("Part")
+	projectile.Size = Vector3.new(4, 4, 8)
+	projectile.Shape = Enum.PartType.Ball
+	projectile.Material = Enum.Material.Neon
+	projectile.Color = Color3.fromRGB(170, 0, 255)
+	projectile.Anchored = true
+	projectile.CanCollide = false
+	projectile.CFrame = root.CFrame * CFrame.new(0, 0, -8)
+	projectile.Parent = workspace
+	cleanup:Add(projectile)
 
-		local elapsed = 0
-		local connection
-		connection = RunService.Heartbeat:Connect(function(step)
-			elapsed = elapsed + step
-			local alpha = math.clamp(elapsed / duration, 0, 1)
-			local alphaCurve = alpha^2
+	currentState = AbilityState.Charging
 
-			for _, emitter in ipairs(emitters) do
-				local startColor = emitter.Color.Keypoints[1].Value
-				local targetColor = Color3.fromRGB(255, 0, 255)
-				local newColor = Color3.new(
-					startColor.R + (targetColor.R - startColor.R) * alphaCurve,
-					startColor.G + (targetColor.G - startColor.G) * alphaCurve,
-					startColor.B + (targetColor.B - startColor.B) * alphaCurve
-				)
-				emitter.Color = ColorSequence.new(newColor)
-			end
+	local chargeTween = TweenService:Create(
+		projectile,
+		TweenInfo.new(1.5, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out),
+		{ Size = Vector3.new(10, 10, 20) }
+	)
+	chargeTween:Play()
+	chargeTween.Completed:Wait()
 
-			if alpha >= 1 then
-				connection:Disconnect()
-			end
-		end)
-	end
+	currentState = AbilityState.Releasing
 
-	local function tweenBeamToMagenta(attachment, duration)
-		local beams = {}
-		for _, descendant in ipairs(attachment:GetDescendants()) do
-			if descendant:IsA("Beam") then
-				table.insert(beams, descendant)
-			end
-		end
+	local targetCF = projectile.CFrame * CFrame.new(0, 0, -PROJECTILE_DISTANCE)
+	local releaseTween = TweenService:Create(
+		projectile,
+		TweenInfo.new(0.5, Enum.EasingStyle.Linear),
+		{ CFrame = targetCF }
+	)
+	releaseTween:Play()
 
-		local elapsed = 0
-		local connection
-		connection = RunService.Heartbeat:Connect(function(step)
-			elapsed = elapsed + step
-			local alpha = math.clamp(elapsed / duration, 0, 1)
-			local alphaCurve = alpha^2
-
-			for _, beam in ipairs(beams) do
-				local startColor = beam.Color.Keypoints[1].Value
-				local targetColor = Color3.fromRGB(255, 0, 255)
-				local newColor = Color3.new(
-					startColor.R + (targetColor.R - startColor.R) * alphaCurve,
-					startColor.G + (targetColor.G - startColor.G) * alphaCurve,
-					startColor.B + (targetColor.B - startColor.B) * alphaCurve
-				)
-				beam.Color = ColorSequence.new(newColor)
-			end
-
-			if alpha >= 1 then
-				connection:Disconnect()
-			end
-		end)
-	end
-
-	local function tweenBeamToTransparency(attachment, duration)
-		local beams = {}
-		for _, descendant in ipairs(attachment:GetDescendants()) do
-			if descendant:IsA("Beam") then
-				table.insert(beams, descendant)
-			end
-		end
-
-		local elapsed = 0
-		local connection
-		connection = RunService.Heartbeat:Connect(function(step)
-			elapsed = elapsed + step
-			local alpha = math.clamp(elapsed / duration, 0, 1)
-			local alphaCurve = alpha^2
-
-			for _, beam in ipairs(beams) do
-				local startSeq = beam.Transparency
-				local keypoints = {}
-
-				for _, kp in ipairs(startSeq.Keypoints) do
-					local newVal = kp.Value + (1 - kp.Value) * alphaCurve
-					table.insert(keypoints, NumberSequenceKeypoint.new(kp.Time, newVal, kp.Envelope))
-				end
-
-				beam.Transparency = NumberSequence.new(keypoints)
-			end
-
-			if alpha >= 1 then
-				connection:Disconnect()
-			end
-		end)
-	end
-
-    -- clone red
-	local red = script["Reversal Red"]:Clone()
-	red.CFrame = root.CFrame * CFrame.new(10, 0, 10)
-	red.beamend.CFrame = CFrame.new(15, 0, 0)
-	red.Parent = char
-	task.wait()
-	emitOnce(red)
-	red.VFX_Attachment.Blackhole:Emit(1)
-	wait(1)
-    
-    --clone blue
-	local blue = script["Amplification Blue"]:Clone()
-	blue.CFrame = root.CFrame * CFrame.new(-10, 0, 10)
-	blue.beamend.CFrame = CFrame.new(-15, 0, 0)
-	blue.Parent = char
-	task.wait()
-	emitOnce(blue)
-	blue.VFX_Attachment.Blackhole:Emit(1)
-	wait(2)
-
-	local redTargetCF = red.CFrame * CFrame.new(-10, 0, 0)
-	local blueTargetCF = blue.CFrame * CFrame.new(10, 0, 0)
-	local tweenInfo = TweenInfo.new(3, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out)
-	local redTween = ts:Create(red, tweenInfo, {CFrame = redTargetCF})
-	local blueTween = ts:Create(blue, tweenInfo, {CFrame = blueTargetCF})
-    
-    --da tweens
-	tweenParticlesToMagenta(red, 3)
-	tweenParticlesToMagenta(blue, 3)
-	tweenBeamToMagenta(red.beamend, 3)
-	tweenBeamToMagenta(blue.beamend, 3)
-    
-	redTween:Play()
-	blueTween:Play()
-
-
-    -- da HOLOW PURPLE MWAHAHAHAHAHAHA (cmon if u watched jjk u can understand)
-	local hp = script["Hollow Purple"]:Clone()
-	hp.Parent = char
-	hp.CFrame = root.CFrame * CFrame.new(0, 0, 10)
-	for _, descendant in ipairs(hp.fx:GetDescendants()) do
-		if descendant:IsA("ParticleEmitter") then
-			descendant.Enabled = false
-		end
-	end
-
-	wait(2.5)
-
-    --make blue and red peace out
-	for _, descendant in ipairs(red.VFX_Attachment:GetDescendants()) do
-		if descendant:IsA("ParticleEmitter") then
-			descendant.Enabled = false
-		end
-	end
-	for _, descendant in ipairs(blue.VFX_Attachment:GetDescendants()) do
-		if descendant:IsA("ParticleEmitter") then
-			descendant.Enabled = false
-		end
-	end
-
-    --more tweens/functions and buncha yapping
-	tweenBeamToTransparency(red.beamend, 1)
-	tweenBeamToTransparency(blue.beamend, 1)
-	task.wait(1) -- wait for fade to finish
-
-	red.beamend["Images/0009"].Enabled = false
-	blue.beamend["Images/0009"].Enabled = false
-	blue.Attachment["Images/Absorb_Wind_3"].Enabled = false
-	red.Attachment["Images/Absorb_Wind_3"].Enabled = false
-
-	hp["Images/Fixed_129"].Enabled = false
-	hp.CFrame = root.CFrame * CFrame.new(0,5,-10)
-	hp["Images/Fixed_129"].Enabled = true
-
-	wait(1)
-
-    --da hp fx
-	for _, descendant in ipairs(hp.fx:GetDescendants()) do
-		if descendant:IsA("ParticleEmitter") then
-			descendant:Emit(1)
-		end
-	end
-
-	wait(3)
-
-    --more tweens :D
-	local hpTargetCF = hp.CFrame * CFrame.new(0, 0, -250)
-	local hpTweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
-	local hpTween = ts:Create(hp, hpTweenInfo, {CFrame = hpTargetCF})
-	hpTween:Play()
-
-    -- the hitbox for dmg
 	local hitbox = Instance.new("Part")
-	hitbox.Parent = char
-	hitbox.Size = Vector3.new(5, 5, 100)
-	hitbox.CFrame = root.CFrame * CFrame.new(0, 0, -50)
-	hitbox.CanCollide = false
+	hitbox.Size = Vector3.new(8, 8, PROJECTILE_DISTANCE)
 	hitbox.Anchored = true
+	hitbox.CanCollide = false
 	hitbox.Transparency = 1
-	hitbox.BrickColor = BrickColor.new("Bright blue")
-	hitbox.Material = Enum.Material.Neon
+	hitbox.CFrame = root.CFrame * CFrame.new(0, 0, -PROJECTILE_DISTANCE / 2)
+	hitbox.Parent = workspace
+	cleanup:Add(hitbox)
 
-    --another function
-	local function damagePlayers()
-		local hitChars = {}
-		for _, obj in pairs(workspace:GetPartsInPart(hitbox)) do
-			local enemyChar = obj.Parent
-			if enemyChar and enemyChar ~= char and not hitChars[enemyChar] then
-				local enemyHum = enemyChar:FindFirstChildOfClass("Humanoid")
-				if enemyHum then
-					hitChars[enemyChar] = true
-					enemyHum.WalkSpeed = 0
-					enemyHum.JumpPower = 0
-					enemyHum.AutoRotate = false
-					enemyHum:TakeDamage(100)
-					task.wait(1)
-				end
-			end
-		end
-	end
-	damagePlayers()
+	applyDamage(hitbox, character)
 
-    --reset user stats
-	for _, obj in pairs(workspace:GetPartsInPart(hitbox)) do
-		local enemyChar = obj.Parent
-		if enemyChar and enemyChar ~= char then
-			local enemyHum = enemyChar:FindFirstChildOfClass("Humanoid")
-			if enemyHum then
-				enemyHum.WalkSpeed = 16 
-				enemyHum.JumpPower = 50 
-				enemyHum.AutoRotate = true
-			end
-		end
-	end
+	releaseTween.Completed:Wait()
 
-	wait(2)
+	currentState = AbilityState.Cooldown
 
-    --make everything peace out
-	for _, obj in pairs({red, hp, blue, hitbox}) do
-		obj:Destroy()
-	end
+	cleanup:Cleanup()
 
-	hum.WalkSpeed = 16
-	hum.JumpPower = 50
-	hum.AutoRotate = true
+	-- Restores player movement after the ability
+	humanoid.WalkSpeed = 16
+	humanoid.JumpPower = 50
+	humanoid.AutoRotate = true
 	root.Anchored = false
 end)
--- yh PLEASE APPROVE IT PLEASE I FAILED SCRIPTER APPLICATION 5 TIMES ALREADY PLEASE APPROVE IT
